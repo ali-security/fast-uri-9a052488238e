@@ -576,13 +576,16 @@ test('CVE-2026-110306: normalization cannot synthesize a scheme from encoded inp
 })
 
 test('CVE-2026-110306: resolve cannot synthesize a scheme from encoded input', (t) => {
-  t.plan(ENCODED_SCHEME_INPUTS.length * 2)
+  t.plan(ENCODED_SCHEME_INPUTS.length)
 
+  // A percent-encoded scheme is not a valid RFC 3986 scheme, so resolve()
+  // rejects it rather than emitting it (CVE-2026-76172) or decoding it.
   ENCODED_SCHEME_INPUTS.forEach((uri) => {
-    const encodedScheme = uri.slice(0, uri.indexOf(':'))
-    const resolved = fastURI.resolve('https://example.com/app/', uri)
-    t.notOk(DANGEROUS_SCHEME_PREFIX.test(resolved), `${uri} does not resolve to a javascript/data/vbscript URI`)
-    t.equal(resolved.indexOf(encodedScheme + ':'), 0, `${uri} resolves with its scheme still encoded`)
+    t.throws(
+      () => fastURI.resolve('https://example.com/app/', uri),
+      /URI scheme is malformed\./,
+      `${uri} is rejected by resolve instead of resolving to a javascript/data/vbscript URI`
+    )
   })
 })
 
@@ -599,6 +602,155 @@ test('CVE-2026-110306: an encoded scheme does not alias or select a plain scheme
   t.equal(ws.scheme, 'w%73', 'the ws scheme stays encoded')
   t.equal(ws.resourceName, undefined, 'ws parsing does not run for an encoded scheme')
 
-  const serialized = fastURI.serialize({ scheme: '%6Aavascript', path: 'alert(1)' })
-  t.notOk(DANGEROUS_SCHEME_PREFIX.test(serialized), 'an encoded component scheme does not serialize as javascript:')
+  t.throws(
+    () => fastURI.serialize({ scheme: '%6Aavascript', path: 'alert(1)' }),
+    /URI scheme is malformed\./,
+    'an encoded component scheme can not serialize as javascript:'
+  )
+})
+
+const MALFORMED_SCHEME_ERROR = 'URI scheme is malformed.'
+
+test('CVE-2026-76172: a scheme that would decode into reserved delimiters is rejected', (t) => {
+  const malformed = [
+    '%2f%2fevil.example:/pwn',
+    '%2F%2Fevil.example:/pwn',
+    'ht%74p%2f%2fevil.example:/x',
+    '%u002f%u002fevil.example:/pwn'
+  ]
+
+  t.plan(malformed.length * 2)
+
+  malformed.forEach((uri) => {
+    t.equal(fastURI.parse(uri).error, MALFORMED_SCHEME_ERROR, `parse rejects ${uri}`)
+    t.equal(fastURI.normalize(uri), uri, `normalize preserves the failing input ${uri}`)
+  })
+})
+
+test('CVE-2026-76172: resolve throws when a component scheme carries delimiters', (t) => {
+  t.plan(2)
+  t.throws(
+    () => fastURI.resolve('%2f%2fevil.example:/pwn', 'child'),
+    /URI scheme is malformed/,
+    'resolve rejects a malformed base scheme'
+  )
+  t.throws(
+    () => fastURI.serialize({ scheme: '%2f%2fevil.example', path: '/pwn' }),
+    /URI scheme is malformed/,
+    'serialize rejects a component scheme that would decode to delimiters'
+  )
+})
+
+test('CVE-2026-76172: valid schemes are still accepted and an encoded scheme is never decoded', (t) => {
+  t.plan(8)
+  // RFC 3986 section 3.1 does not allow percent-encoding in a scheme
+  // (CVE-2026-110306), so an encoded scheme is rejected rather than decoded.
+  const encoded = fastURI.parse('htt%70://example.com/')
+  t.equal(encoded.error, MALFORMED_SCHEME_ERROR, 'an encoded scheme is malformed')
+  t.equal(encoded.scheme, 'htt%70', 'an encoded scheme is not decoded to http')
+  t.equal(fastURI.normalize('HTTP://example.com/'), 'http://example.com/', 'scheme is lowercased')
+  t.equal(fastURI.parse('HTTP://example.com/').scheme, 'http', 'parse lowercases a valid scheme')
+  t.equal(fastURI.parse('a1+.-:value').scheme, 'a1+.-', 'every RFC 3986 scheme character is accepted')
+  t.equal(fastURI.parse('a1+.-:value').error, undefined, 'a valid scheme is not an error')
+  t.equal(fastURI.serialize({ scheme: 'foo+bar', path: 'value' }), 'foo+bar:value', 'a valid component scheme is serialized')
+  t.equal(fastURI.resolve('HTTP://example.com/a/b', 'c'), 'http://example.com/a/c', 'resolve accepts a valid scheme')
+})
+
+test('CVE-2026-76172: no API emits a delimiter-bearing scheme that reparses as an authority', (t) => {
+  t.plan(11)
+  t.throws(
+    () => fastURI.resolve('http://example.com/', '%2f%2fevil.example:/pwn'),
+    /URI scheme is malformed/,
+    'resolve rejects a malformed reference scheme'
+  )
+  t.throws(
+    () => fastURI.serialize({ scheme: '//evil.example', path: '/pwn' }),
+    /URI scheme is malformed/,
+    'serialize rejects a raw component scheme containing delimiters'
+  )
+  t.throws(
+    () => fastURI.normalize({ scheme: '%2f%2fevil.example', path: '/pwn' }),
+    /URI scheme is malformed/,
+    'normalize rejects a component scheme that would decode to delimiters'
+  )
+  t.throws(
+    () => fastURI.normalize({ scheme: '//evil.example', path: '/pwn' }),
+    /URI scheme is malformed/,
+    'normalize rejects a raw component scheme containing delimiters'
+  )
+  t.throws(
+    () => fastURI.resolveComponent(
+      { scheme: 'http', host: 'example.com', path: '/' },
+      { scheme: '%2f%2fevil.example', path: '/pwn' }
+    ),
+    /URI scheme is malformed/,
+    'resolveComponent rejects a relative component scheme that would decode to delimiters'
+  )
+  t.throws(
+    () => fastURI.resolveComponent(
+      { scheme: 'http', host: 'example.com', path: '/' },
+      { scheme: '//evil.example', path: '/pwn' }
+    ),
+    /URI scheme is malformed/,
+    'resolveComponent rejects a relative component scheme containing delimiters'
+  )
+  t.notEqual(fastURI.parse('%2f%2fevil.example:/pwn').scheme, '//evil.example', 'parse does not decode the scheme into delimiters')
+  t.equal(fastURI.equal('%2f%2fevil.example:/pwn', '%2f%2fevil.example:/pwn'), false, 'equal fails closed on malformed string schemes')
+  t.equal(fastURI.equal('%2f%2fevil.example:/pwn', '//evil.example:/pwn'), false, 'equal does not match the reparsed authority')
+  const component = { scheme: '//evil.example', path: '/pwn' }
+  t.equal(fastURI.equal(component, component), false, 'equal fails closed on malformed component schemes')
+  t.equal(fastURI.equal(component, '//evil.example:/pwn'), false, 'equal does not throw on, or match, a malformed component scheme')
+})
+
+test('CVE-2026-76172: schemes outside the RFC 3986 grammar are rejected', (t) => {
+  const malformed = [
+    '%0d%0aSet-Cookie:%20sid=attacker:/p',
+    'foo%3Abar:value',
+    'foo%2Fbar:value',
+    '1http://example.com/',
+    'foo_bar:value',
+    'éxample:value',
+    // U+212A KELVIN SIGN lowercases to an ASCII "k"
+    'Kttp://example.com/',
+    // U+017F LATIN SMALL LETTER LONG S uppercases to an ASCII "S"
+    'ſcheme:value'
+  ]
+
+  t.plan(malformed.length * 3 + 2)
+
+  malformed.forEach((uri) => {
+    t.equal(fastURI.parse(uri).error, MALFORMED_SCHEME_ERROR, `parse rejects ${JSON.stringify(uri)}`)
+    t.equal(fastURI.normalize(uri), uri, `normalize preserves the failing input ${JSON.stringify(uri)}`)
+    t.equal(fastURI.equal(uri, uri, {}), false, `equal fails closed on ${JSON.stringify(uri)}`)
+  })
+
+  t.notOk(fastURI.normalize('%0d%0aSet-Cookie:%20sid=attacker:/p').includes('\r\n'), 'normalized output contains no raw CRLF')
+  t.throws(
+    () => fastURI.serialize({ scheme: 'x\r\nSet-Cookie', path: ' sid=attacker' }),
+    /URI scheme is malformed/,
+    'serialize rejects a component scheme carrying a raw CRLF'
+  )
+})
+
+test('CVE-2026-76172: a scheme handler can not install a malformed scheme while serializing', (t) => {
+  t.plan(1)
+
+  fastURI.SCHEMES['x-cve-2026-76172'] = {
+    scheme: 'x-cve-2026-76172',
+    parse: (component) => component,
+    serialize: (component) => {
+      component.scheme = '//evil.example'
+      return component
+    }
+  }
+
+  try {
+    t.throws(
+      () => fastURI.serialize({ scheme: 'x-cve-2026-76172', path: '/pwn' }),
+      /URI scheme is malformed/,
+      'the scheme is revalidated after scheme specific serialization'
+    )
+  } finally {
+    delete fastURI.SCHEMES['x-cve-2026-76172']
+  }
 })
