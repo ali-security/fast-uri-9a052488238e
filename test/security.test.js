@@ -541,3 +541,64 @@ test('CVE-2026-84292: a component port can not inject a new authority', (t) => {
     'equal does not match a URI whose authority host is 127.0.0.1'
   )
 })
+
+const DANGEROUS_SCHEME = /^(?:javascript|data|vbscript)$/i
+const DANGEROUS_SCHEME_PREFIX = /^(?:javascript|data|vbscript):/i
+const ENCODED_SCHEME_INPUTS = [
+  '%6Aavascript:alert(1)',
+  '%4A%41%56%41%53%43%52%49%50%54:alert(1)',
+  '%u006Aavascript:alert(1)',
+  'j%61vascript:alert(1)',
+  '%64ata:text/html,<script>alert(1)</script>',
+  'vb%73cript:msgbox(1)'
+]
+
+test('CVE-2026-110306: parse never decodes a percent-encoded scheme', (t) => {
+  t.plan(ENCODED_SCHEME_INPUTS.length * 2)
+
+  ENCODED_SCHEME_INPUTS.forEach((uri) => {
+    const encodedScheme = uri.slice(0, uri.indexOf(':'))
+    const parsed = fastURI.parse(uri)
+    t.equal(parsed.scheme, encodedScheme, `${uri} keeps its scheme encoded`)
+    t.notOk(DANGEROUS_SCHEME.test(parsed.scheme), `${uri} does not parse as a javascript/data/vbscript scheme`)
+  })
+})
+
+test('CVE-2026-110306: normalization cannot synthesize a scheme from encoded input', (t) => {
+  t.plan(ENCODED_SCHEME_INPUTS.length * 2)
+
+  ENCODED_SCHEME_INPUTS.forEach((uri) => {
+    const encodedScheme = uri.slice(0, uri.indexOf(':'))
+    const normalized = fastURI.normalize(uri)
+    t.notOk(DANGEROUS_SCHEME_PREFIX.test(normalized), `${uri} does not normalize to a javascript/data/vbscript URI`)
+    t.equal(normalized.indexOf(encodedScheme + ':'), 0, `${uri} normalizes with its scheme still encoded`)
+  })
+})
+
+test('CVE-2026-110306: resolve cannot synthesize a scheme from encoded input', (t) => {
+  t.plan(ENCODED_SCHEME_INPUTS.length * 2)
+
+  ENCODED_SCHEME_INPUTS.forEach((uri) => {
+    const encodedScheme = uri.slice(0, uri.indexOf(':'))
+    const resolved = fastURI.resolve('https://example.com/app/', uri)
+    t.notOk(DANGEROUS_SCHEME_PREFIX.test(resolved), `${uri} does not resolve to a javascript/data/vbscript URI`)
+    t.equal(resolved.indexOf(encodedScheme + ':'), 0, `${uri} resolves with its scheme still encoded`)
+  })
+})
+
+test('CVE-2026-110306: an encoded scheme does not alias or select a plain scheme', (t) => {
+  t.plan(5)
+  t.equal(fastURI.equal('%68ttp://a/', 'http://a/'), false, 'encoded scheme does not alias a plain scheme')
+  t.equal(
+    fastURI.normalize('ht%74ps://example.com:443'),
+    'ht%74ps://example.com:443',
+    'HTTPS normalization does not run for an encoded scheme'
+  )
+
+  const ws = fastURI.parse('w%73://example.com/a?b')
+  t.equal(ws.scheme, 'w%73', 'the ws scheme stays encoded')
+  t.equal(ws.resourceName, undefined, 'ws parsing does not run for an encoded scheme')
+
+  const serialized = fastURI.serialize({ scheme: '%6Aavascript', path: 'alert(1)' })
+  t.notOk(DANGEROUS_SCHEME_PREFIX.test(serialized), 'an encoded component scheme does not serialize as javascript:')
+})
